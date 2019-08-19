@@ -154,25 +154,29 @@ void cnpy::parse_npy_header(FILE* fp, size_t& word_size, std::vector<size_t>& sh
 
 void cnpy::parse_zip_footer(FILE* fp, uint16_t& nrecs, size_t& global_header_size, size_t& global_header_offset)
 {
-    std::vector<char> footer(22);
-    fseek(fp,-22,SEEK_END);
-    size_t res = fread(&footer[0],sizeof(char),22,fp);
-    if(res != 22)
-        throw std::runtime_error("parse_zip_footer: failed fread");
+    std::vector<char> ecdr(56);
+    fseek(fp, -98, SEEK_END);
+    size_t res = fread(&ecdr[0], sizeof(char),56,fp);
+    if(res != 56)
+        throw std::runtime_error("parse_zip_ecdr: failed fread");
 
-    uint16_t disk_no, disk_start, nrecs_on_disk, comment_len;
-    disk_no = *(uint16_t*) &footer[4];
-    disk_start = *(uint16_t*) &footer[6];
-    nrecs_on_disk = *(uint16_t*) &footer[8];
-    nrecs = *(uint16_t*) &footer[10];
-    global_header_size = *(uint32_t*) &footer[12];
-    global_header_offset = *(uint32_t*) &footer[16];
-    comment_len = *(uint16_t*) &footer[20];
-
+    uint32_t disk_no, disk_start;
+    uint64_t nrecs_on_disk, ecdr_len;
+    ecdr_len = *(uint64_t*) &ecdr[4];
+    disk_no = *(uint32_t*) &ecdr[16];
+    disk_start = *(uint32_t*) &ecdr[20];
+    nrecs_on_disk = *(uint64_t*) &ecdr[24];
+    nrecs = *(uint64_t*) &ecdr[32];
+    global_header_size = *(uint64_t*) &ecdr[40];
+    global_header_offset = *(uint64_t*) &ecdr[48];
     assert(disk_no == 0);
     assert(disk_start == 0);
     assert(nrecs_on_disk == nrecs);
-    assert(comment_len == 0);
+    assert(ecdr_len == 44);
+    UNREF(disk_no);
+    UNREF(disk_start);
+    UNREF(nrecs_on_disk);
+    UNREF(ecdr_len);
 }
 
 cnpy::NpyArray load_the_npy_file(FILE* fp) {
@@ -228,13 +232,17 @@ cnpy::NpyArray load_the_npz_array(FILE* fp, uint32_t compr_bytes, uint32_t uncom
 }
 
 cnpy::npz_t cnpy::npz_load(std::string fname) {
-    FILE* fp = fopen(fname.c_str(),"rb");
-
-    if(!fp) {
-        throw std::runtime_error("npz_load: Error! Unable to open file "+fname+"!");
+     FILE* fp;
+#ifdef WIN32
+	fopen_s(&fp, fname.c_str(), "rb");
+#else
+    fp = fopen64(fname.c_str(), "rb");
+#endif
+    if(!fp)
+    {
+        LOG(FATAL) << "npz_load: Error! Unable to open file!" << fname.c_str() <<"!";
     }
-
-    cnpy::npz_t arrays;  
+    cnpy::npz_t arrays;
 
     while(1) {
         std::vector<char> local_header(30);
@@ -257,29 +265,34 @@ cnpy::npz_t cnpy::npz_load(std::string fname) {
 
         //read in the extra field
         uint16_t extra_field_len = *(uint16_t*) &local_header[28];
-        if(extra_field_len > 0) {
-            std::vector<char> buff(extra_field_len);
-            size_t efield_res = fread(&buff[0],sizeof(char),extra_field_len,fp);
-            if(efield_res != extra_field_len)
-                throw std::runtime_error("npz_load: failed fread");
-        }
+        std::vector<char> buff(extra_field_len);
+        size_t efield_res = fread(&buff[0],sizeof(char),extra_field_len,fp);
+        if(efield_res != extra_field_len)
+            throw std::runtime_error("npz_load: failed fread");
+
 
         uint16_t compr_method = *reinterpret_cast<uint16_t*>(&local_header[0]+8);
-        uint32_t compr_bytes = *reinterpret_cast<uint32_t*>(&local_header[0]+18);
-        uint32_t uncompr_bytes = *reinterpret_cast<uint32_t*>(&local_header[0]+22);
+        uint32_t compr_bytes = *reinterpret_cast<uint64_t*>(&buff[0]+4);
+        uint32_t uncompr_bytes = *reinterpret_cast<uint64_t*>(&buff[0]+12);
 
         if(compr_method == 0) {arrays[varname] = load_the_npy_file(fp);}
         else {arrays[varname] = load_the_npz_array(fp,compr_bytes,uncompr_bytes);}
     }
 
     fclose(fp);
-    return arrays;  
+    return arrays;
 }
 
 cnpy::NpyArray cnpy::npz_load(std::string fname, std::string varname) {
-    FILE* fp = fopen(fname.c_str(),"rb");
-
-    if(!fp) throw std::runtime_error("npz_load: Unable to open file "+fname);
+	FILE* fp;
+#ifdef WIN32
+	fopen_s(&fp, fname.c_str(), "rb");
+#else
+    fp = fopen64(fname.c_str(), "rb");
+#endif
+    if(!fp) {
+        LOG(FATAL) << "npz_load: Error! Unable to open file!" << fname.c_str() <<"!";
+    }       
 
     while(1) {
         std::vector<char> local_header(30);
@@ -300,11 +313,14 @@ cnpy::NpyArray cnpy::npz_load(std::string fname, std::string varname) {
 
         //read in the extra field
         uint16_t extra_field_len = *(uint16_t*) &local_header[28];
-        fseek(fp,extra_field_len,SEEK_CUR); //skip past the extra field
+        std::vector<char> extra_field(extra_field_len);
+        size_t extra_res = fread(&extra_field[0], sizeof(char), extra_field_len, fp);
+        if(extra_res != extra_field_len)
+             throw std::runtime_error("npz_load: failed fread");
         
         uint16_t compr_method = *reinterpret_cast<uint16_t*>(&local_header[0]+8);
-        uint32_t compr_bytes = *reinterpret_cast<uint32_t*>(&local_header[0]+18);
-        uint32_t uncompr_bytes = *reinterpret_cast<uint32_t*>(&local_header[0]+22);
+        uint32_t compr_bytes = *reinterpret_cast<uint64_t*>(&extra_field[0]+4);
+        uint32_t uncompr_bytes = *reinterpret_cast<uint64_t*>(&extra_field[0]+12);
 
         if(vname == varname) {
             NpyArray array  = (compr_method == 0) ? load_the_npy_file(fp) : load_the_npz_array(fp,compr_bytes,uncompr_bytes);
@@ -313,8 +329,12 @@ cnpy::NpyArray cnpy::npz_load(std::string fname, std::string varname) {
         }
         else {
             //skip past the data
-            uint32_t size = *(uint32_t*) &local_header[22];
+            size_t size = *(uint32_t*) &extra_field[12];
+#ifdef WIN32
+            _fseeki64(fp,size,SEEK_CUR);
+#else
             fseek(fp,size,SEEK_CUR);
+#endif
         }
     }
 

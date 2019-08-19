@@ -141,7 +141,11 @@ namespace cnpy {
         size_t global_header_offset = 0;
         std::vector<char> global_header;
 
-        if(mode == "a") fp = fopen(zipname.c_str(),"r+b");
+#ifdef WIN32
+        if(mode == "a") fopen_s(&fp,zipname.c_str(),"r+b");
+#else
+        if(mode == "a") fp = fopen64(zipname.c_str(), "r+b");
+#endif
 
         if(fp) {
             //zip file exists. we need to add a new npy file to it.
@@ -150,17 +154,28 @@ namespace cnpy {
             //below, we will write the the new data at the start of the global header then append the global header and footer below it
             size_t global_header_size;
             parse_zip_footer(fp,nrecs,global_header_size,global_header_offset);
+#ifdef WIN32
+            _fseeki64(fp,global_header_offset,SEEK_SET);
+#else
             fseek(fp,global_header_offset,SEEK_SET);
+#endif
             global_header.resize(global_header_size);
             size_t res = fread(&global_header[0],sizeof(char),global_header_size,fp);
             if(res != global_header_size){
                 throw std::runtime_error("npz_save: header read error while adding to existing zip");
             }
+#ifdef WIN32
+            _fseeki64(fp,global_header_offset,SEEK_SET);
+#else
             fseek(fp,global_header_offset,SEEK_SET);
+#endif
         }
         else {
-            fp = fopen(zipname.c_str(),"wb");
-        }
+#ifdef WIN32
+            fopen_s(&fp, zipname.c_str(),"wb");
+#else
+            fp = fopen64(zipname.c_str(),"wb");
+#endif        }
 
         std::vector<char> npy_header = create_npy_header<T>(shape);
 
@@ -168,8 +183,8 @@ namespace cnpy {
         size_t nbytes = nels*sizeof(T) + npy_header.size();
 
         //get the CRC of the data to be added
-        uint32_t crc = crc32(0L,(uint8_t*)&npy_header[0],npy_header.size());
-        crc = crc32(crc,(uint8_t*)data,nels*sizeof(T));
+        uint32_t crc = crc32_z(0L,(uint8_t*)&npy_header[0],npy_header.size());
+        crc = crc32_z(crc,(uint8_t*)data,nels*sizeof(T));
 
         //build the local header
         std::vector<char> local_header;
@@ -181,11 +196,19 @@ namespace cnpy {
         local_header += (uint16_t) 0; //file last mod time
         local_header += (uint16_t) 0;     //file last mod date
         local_header += (uint32_t) crc; //crc
-        local_header += (uint32_t) nbytes; //compressed size
-        local_header += (uint32_t) nbytes; //uncompressed size
+        local_header += (uint32_t) 0xffffffff; //compressed size, real value in zip64 extra fields
+        local_header += (uint32_t) 0xffffffff; //uncompressed size
         local_header += (uint16_t) fname.size(); //fname length
-        local_header += (uint16_t) 0; //extra field length
+        local_header += (uint16_t) 32; //extra field length
         local_header += fname;
+
+        //zip64 extra fields to deal with zipped files >4GB
+        local_header += (uint16_t) 0x0001;
+        local_header += (uint16_t) 28;
+        local_header += (uint64_t) nbytes;
+        local_header += (uint64_t) nbytes;
+        local_header += (uint64_t) global_header_offset;
+        local_header += (uint32_t) 0;
 
         //build global header
         global_header += "PK"; //first part of sig
@@ -196,10 +219,42 @@ namespace cnpy {
         global_header += (uint16_t) 0; //disk number where file starts
         global_header += (uint16_t) 0; //internal file attributes
         global_header += (uint32_t) 0; //external file attributes
-        global_header += (uint32_t) global_header_offset; //relative offset of local file header, since it begins where the global header used to begin
+        global_header += (uint32_t) 0xffffffff; //relative offset of local file header, since it begins where the global header used to begin
         global_header += fname;
 
-        //build footer
+        //copied zip64 extra field
+        global_header += (uint16_t) 0x0001;
+        global_header += (uint16_t) 28;
+        global_header += (uint64_t) nbytes;
+        global_header += (uint64_t) nbytes;
+        global_header += (uint64_t) global_header_offset;
+        global_header += (uint32_t) 0;
+
+
+        //build zip64 end of central directory record
+        std::vector<char> ecdr;
+        ecdr += "PK"; //first part of sig
+        ecdr += (uint16_t) 0x0606; //second part of sig
+        ecdr += (uint64_t) 44;//size of zip64 end of central directory record
+        ecdr += (uint16_t) 20; //version made by
+        ecdr += (uint16_t) 20; //min version needed to extract
+        ecdr += (uint32_t) 0; //number of this disk
+        ecdr += (uint32_t) 0; //number of the disk with the start of the central directory
+        ecdr += (uint64_t) (nrecs+1); //total number of entries in the central directory on this disk
+        ecdr += (uint64_t) (nrecs+1);//total number of entries in the central directory
+        ecdr += (uint64_t) global_header.size(); //size of the central directory
+        ecdr += (uint64_t) (global_header_offset + nbytes + local_header.size()); // offset of start of central directory with respect to the starting disk number
+ 
+        //build zip64 end of central directory record locator
+        std::vector<char> locator;
+        locator += "PK"; //first part of sig
+        locator += (uint16_t) 0x0706; //second part of sig
+        locator += (uint32_t) 0; //number of the disk with the start of the zip64 end of central directory 
+        //relative offset of the zip64 end of central directory record
+        locator += (uint64_t) (global_header_offset + nbytes + local_header.size() + global_header.size());
+        locator += (uint32_t) 1; //total number of disks
+
+        //build footer, not useful in zip64
         std::vector<char> footer;
         footer += "PK"; //first part of sig
         footer += (uint16_t) 0x0605; //second part of sig
@@ -208,7 +263,7 @@ namespace cnpy {
         footer += (uint16_t) (nrecs+1); //number of records on this disk
         footer += (uint16_t) (nrecs+1); //total number of records
         footer += (uint32_t) global_header.size(); //nbytes of global headers
-        footer += (uint32_t) (global_header_offset + nbytes + local_header.size()); //offset of start of global headers, since global header now starts after newly written array
+        footer += (uint32_t) 0xffffffff; //offset of start of global headers, since global header now starts after newly written array
         footer += (uint16_t) 0; //zip file comment length
 
         //write everything
@@ -216,6 +271,8 @@ namespace cnpy {
         fwrite(&npy_header[0],sizeof(char),npy_header.size(),fp);
         fwrite(data,sizeof(T),nels,fp);
         fwrite(&global_header[0],sizeof(char),global_header.size(),fp);
+        fwrite(&ecdr[0],sizeof(char),ecdr.size(),fp);
+        fwrite(&locator[0],sizeof(char),locator.size(),fp);
         fwrite(&footer[0],sizeof(char),footer.size(),fp);
         fclose(fp);
     }
